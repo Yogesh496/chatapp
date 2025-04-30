@@ -1,0 +1,311 @@
+const Group = require("../model/group");
+const User = require("../model/credential");
+const Message=require("../model/message.js")
+const cloudinary = require("../config/cloudinary");  
+const mongoose = require("mongoose");
+const { getReceiverSocketId, io } = require("../config/socket.js");
+
+const sendGroupMessage = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const { text, image, audio, document,documentName } = req.body;
+    const senderId = req.user._id;
+
+    const group = await Group.findById(groupId);
+    if (!group) return res.status(404).json({ error: "Group not found" });
+
+   let imageUrl = "", audioUrl = "", documentUrl = "";
+       if (image && typeof image === "string" && image.startsWith("data:image/")) {
+         const uploadResponse = await cloudinary.uploader.upload(image, { resource_type: "image" });
+         imageUrl = uploadResponse.secure_url;
+       }
+   
+       if (audio && typeof audio === "string" && audio.startsWith("data:audio/")) {
+         const uploadResponse = await cloudinary.uploader.upload(audio, { resource_type: "auto" });
+         audioUrl = uploadResponse.secure_url;
+       }
+   
+       if (document && typeof document === "string") {
+         const uploadResponse = await cloudinary.uploader.upload(document, {
+           resource_type: "raw",
+           public_id: `documents/${Date.now()}-${documentName.split(".")[0]}`,
+           use_filename: true,
+           unique_filename: false,
+         });
+         documentUrl = uploadResponse.secure_url;
+       }
+    const newMessage = {
+      senderId,
+      text,
+      image: imageUrl,
+      audio: audioUrl,
+      document: documentUrl,
+      documentName: documentName || null,
+      createdAt: new Date(), 
+    };
+
+    group.messages.push(newMessage);
+    await group.save();
+    await group.populate('messages.senderId', 'fullName profilePic');
+
+    res.status(201).json({
+      message: "Message sent",
+      newMessage: group.messages[group.messages.length - 1], 
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+
+
+
+const createGroup = async (req, res) => {
+  try {
+    console.log("➡️ Create Group Request:", req.body);
+
+    const { groupName, members, profilePic } = req.body;
+    const userId = req.user?._id;
+
+    if (!groupName || !members || members.length < 2) {
+      return res.status(400).json({ message: "Group name and at least 2 members are required" });
+    }
+
+    const newGroup = new Group({
+      name: groupName,
+      profilePic: profilePic || "",
+      members: [userId, ...members],
+      createdBy: userId,
+      admin: userId, 
+      
+    });
+
+    await newGroup.save();
+    console.log("✅ Group created successfully:", newGroup);
+
+    res.status(201).json({ message: "Group created successfully", group: newGroup });
+  } catch (error) {
+    console.error("❌ Error creating group:", error);
+    res.status(500).json({ message: "Internal server error", error: error.message });
+  }
+};
+
+
+const getGroups = async (req, res) => {
+  try {
+    const userId = req.user._id;
+
+    const groups = await Group.find({ members: userId })
+      .populate("members", "fullName profilePic")
+      .populate("admin", "fullName profilePic")
+      .populate({
+        path: "messages.senderId",
+        select: "fullName profilePic",
+      })
+      .select("name profilePic messages members createdAt") 
+      .lean();
+
+    
+    const formattedGroups = groups.map((group) => {
+      const latestMessage = group.messages.length > 0 ? group.messages[group.messages.length - 1] : null;
+
+      let latestMessageText = null;
+      let messageType = "text";
+
+      if (latestMessage) {
+        if (latestMessage.text) {
+          latestMessageText = latestMessage.text;
+          messageType = "text";
+        } else if (latestMessage.image) {
+          latestMessageText = "📷 Photo";
+          messageType = "image";
+        } else if (latestMessage.audio) {
+          latestMessageText = "🎵 Audio";
+          messageType = "audio";
+        } else if (latestMessage.document) {
+          latestMessageText = "📄 Document";
+          messageType = "document";
+        }
+      }
+
+      return {
+        ...group,
+        latestMessage: latestMessage
+          ? {
+              text: latestMessageText,
+              type: messageType,
+              sender: latestMessage.senderId.fullName,
+            }
+          : null,
+        groupCreatedAt: group.createdAt, 
+      };
+    });
+
+    res.status(200).json(formattedGroups);
+  } catch (error) {
+    console.error("Error fetching groups:", error);
+    res.status(500).json({ message: "Error fetching groups", error });
+  }
+};
+
+
+
+
+const getGroupMessages = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+
+    const group = await Group.findById(groupId)
+      .populate("messages.senderId", "fullName profilePic")
+      .select("messages profilePic name");
+
+    if (!group) return res.status(404).json({ error: "Group not found" });
+
+    console.log("Populated messages:", group.messages); 
+
+    res.status(200).json({
+      messages: group.messages,
+      profilePic: group.profilePic,
+      groupName: group.name,
+    });
+  } catch (error) {
+    console.error(error); 
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+const addUserToGroup = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const { userId } = req.body;
+    console.log("User ID from request:", userId);
+
+    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ error: "Invalid or missing user ID" });
+    }
+
+    
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+
+    
+    const group = await Group.findById(groupId);
+    if (!group) return res.status(404).json({ error: "Group not found" });
+
+    console.log("Group Members:", group.members.map(m => m.toString()));
+
+    
+    const user = await User.findById(userObjectId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    
+    if (group.members.some(member => member.toString() === userObjectId.toString())) {
+      return res.status(400).json({ error: "User is already in the group" });
+    }
+
+    
+    group.members.push(userObjectId);
+    await group.save();
+
+    res.status(200).json({ message: "User added to group", group });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+const leaveGroup = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const userId = req.user._id;
+
+    
+    const group = await Group.findById(groupId);
+    if (!group) return res.status(404).json({ error: "Group not found" });
+
+    
+    group.members = group.members.filter(member => member.toString() !== userId.toString());
+
+    
+    if (group.members.length === 0) {
+      await Group.findByIdAndDelete(groupId);
+      return res.status(200).json({ message: "Group deleted as it had no members left" });
+    } else {
+      
+      await group.save();
+    }
+
+    res.status(200).json({ message: "Successfully left the group" });
+  } catch (error) {
+    console.error("Error leaving the group:", error); 
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+
+const updateGroupProfilePic = async (req, res) => {
+  try {
+    const { profilePic } = req.body; 
+    const groupId = req.params.groupId;
+
+    if (!profilePic) {
+      return res.status(400).json({ message: "Profile pic is required" });
+    }
+
+    
+    console.log("Received profilePic (Base64 string):", profilePic.slice(0, 100)); 
+
+    
+    const uploadResponse = await cloudinary.uploader.upload(profilePic, {
+      folder: "group_pics", 
+    });
+
+    console.log("Cloudinary upload response:", uploadResponse);
+
+    
+    const updatedGroup = await Group.findByIdAndUpdate(
+      groupId,
+      { profilePic: uploadResponse.secure_url },
+      { new: true }
+    );
+
+    res.status(200).json(updatedGroup); 
+  } catch (error) {
+    console.log("Error in update group profile:", error);
+    res.status(500).json({ message: "Internal server error" });
+  }
+};
+
+const updateGroupName = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const { groupName } = req.body;
+
+    if (!groupName) {
+      return res.status(400).json({ message: "New group name is required" });
+    }
+
+    const group = await Group.findById(groupId);
+    if (!group) return res.status(404).json({ error: "Group not found" });
+
+    group.name = groupName; 
+    await group.save(); 
+
+    res.status(200).json({ message: "Group name updated successfully", group });
+  } catch (error) {
+    console.error("Error updating group name:", error);
+    res.status(500).json({ message: "Internal server error" });
+  }
+};
+
+
+module.exports = {
+  createGroup,
+  getGroups,
+  sendGroupMessage,
+  getGroupMessages,
+  addUserToGroup,
+  leaveGroup,
+  updateGroupProfilePic,
+  updateGroupName, 
+};
